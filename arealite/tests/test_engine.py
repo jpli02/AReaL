@@ -3,11 +3,12 @@
 
 """Test script for HF Engine implementation."""
 
+import os
 from typing import Dict
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from arealite.api.cli_args import (
     EngineBackendConfig,
@@ -72,8 +73,13 @@ def backend_type(request):
 
 @pytest.fixture(scope="module")
 def engine(backend_type):
+    os.environ["WORLD_SIZE"] = "1"
+    os.environ["RANK"] = "0"
+    os.environ["LOCAL_RANK"] = "0"
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "7777"
+
     engine_config = EngineConfig(
-        type=ModelFamily("qwen2", False),
         path="Qwen/Qwen2.5-0.5B",
         gradient_checkpointing=False,
         optimizer=OptimizerConfig(),
@@ -86,6 +92,7 @@ def engine(backend_type):
     engine = engine_factory.make_engine(engine_config)
     ft_spec = FinetuneSpec(total_train_epochs=1, dataset_size=100, train_batch_size=2)
     engine.init_distributed(None, ft_spec)
+    engine.load_model_from_hf(engine_config.path)
     print("✓ Engine created successfully")
     yield engine
 
@@ -146,15 +153,20 @@ def test_train_batch(tmp_path_factory, engine, mock_input):
     engine.load_optimizer_state(path)
 
 
+@torch.no_grad()
 def test_save_load_weights(tmp_path_factory, engine, mock_input):
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
     path = tmp_path_factory.mktemp("hf_engine_test")
 
-    engine.save_model_to_hf(path=path, tokenizer=tokenizer)
     old = engine.forward(
         input_=mock_input,
         mb_spec=MicroBatchSpec(n_mbs=1),
     )
+    engine.save_model_to_hf(path=path, tokenizer=tokenizer)
+
+    for name, param in engine.model.named_parameters():
+        param.zero_()
+
     engine.load_model_from_hf(path=path)
     new = engine.forward(
         input_=mock_input,

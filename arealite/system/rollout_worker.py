@@ -10,7 +10,8 @@ import torch.distributed as dist
 
 from arealite.api.cli_args import RolloutControllerConfig, TrainingArgs
 from arealite.api.io_struct import Trajectory
-from arealite.api.rollout_api import RolloutWorkflowFactory
+from arealite.api.llm_client_api import LLMClient, LLMClientFactory
+from arealite.api.rollout_api import RolloutCollectorFactory
 from realhf.base import logging, name_resolve, names
 from realhf.base.monitor import RolloutStat
 from realhf.system.push_pull_stream import ZMQJsonPuller, ZMQJsonPusher
@@ -28,6 +29,7 @@ class RolloutWorker:
         worker_id: int,
         args: TrainingArgs,
         config: RolloutControllerConfig,
+        llm_client: LLMClient | None = None,
         pusher_host: Optional[str] = "localhost",
         pusher_port: Optional[int] = 5555,
         data_puller_host: Optional[str] = "localhost",
@@ -53,6 +55,10 @@ class RolloutWorker:
         self.pusher = None
         self.data_puller = None
 
+        if llm_client is None:
+            llm_client = LLMClientFactory(args).make_client(config.llm_client)
+        self.llm_client = llm_client
+
     def _cleanup(self):
         """Clean up resources."""
         if self.pusher:
@@ -73,12 +79,13 @@ class RolloutWorker:
         """Run grouped episode asynchronously."""
         tasks = []
         for _ in range(self.gconfig.n_samples):
-            # Create workflow
-            factory = RolloutWorkflowFactory(self.args)
-            workflow = factory.make_workflow(self.config.workflow)
+            # Create collector
+            factory = RolloutCollectorFactory(self.args)
+            collector = factory.make_collector(self.config.collector)
             tasks += [
-                workflow.arun_episode(
-                    self.gconfig.new(n_samples=1),
+                collector.arun_episode(
+                    llm_client=self.llm_client,
+                    gconfig=self.gconfig.new(n_samples=1),
                     env_option=data,
                     seed=seed,
                 )

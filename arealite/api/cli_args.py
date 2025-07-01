@@ -62,12 +62,6 @@ class GenerationHyperparameters:
 ## Inference config for clients and servers. ##
 @dataclass
 class LLMServiceConfig:
-    experiment_name: str = field(
-        default=MISSING, metadata={"help": "Name of the experiment. Required."}
-    )
-    trial_name: str = field(
-        default=MISSING, metadata={"help": "Name of the trial. Required."}
-    )
     server_backend: str = field(
         default="sglang",
         metadata={"help": "Backend for serving", "choices": ["sglang", "vllm"]},
@@ -76,11 +70,6 @@ class LLMServiceConfig:
         default=None, metadata={"help": "Name of the served model"}
     )
     model_path: str = field(default="", metadata={"help": "Path to model"})
-    seed: int = field(default=1, metadata={"help": "Random seed"})
-    cluster: ClusterSpecConfig = field(
-        default_factory=ClusterSpecConfig,
-        metadata={"help": "Cluster specification configuration"},
-    )
     parallel: ParallelismConfig = field(
         default_factory=ParallelismConfig,
         metadata={"help": "Model parallelism configuration"},
@@ -260,21 +249,21 @@ class RLVRConfig:
 
 
 @dataclass
-class RolloutWorkflowConfig:
+class RolloutCollectorConfig:
     type: str = field(
         default="rlvr",
         metadata={
-            "help": "Rollout workflow type",
+            "help": "Rollout collector type",
             "choices": ["rlvr", "math_code_single_step"],
         },
     )
     rlvr: Optional[RLVRConfig] = field(
         default=None,
-        metadata={"help": "The configuration for the single-step math/code workflow"},
+        metadata={"help": "The configuration for the RLVR collector"},
     )
     math_code_single_step: Optional[MathCodeSingleStepConfig] = field(
         default=None,
-        metadata={"help": "The configuration for the single-step math/code workflow"},
+        metadata={"help": "The configuration for the single-step math/code collector"},
     )
 
 
@@ -283,9 +272,9 @@ class RolloutWorkflowConfig:
 
 @dataclass
 class RolloutControllerConfig:
-    workflow: RolloutWorkflowConfig = field(
-        default_factory=RolloutWorkflowConfig,
-        metadata={"help": "Rollout workflow configuration."},
+    collector: RolloutCollectorConfig = field(
+        default_factory=RolloutCollectorConfig,
+        metadata={"help": "Rollout collector configuration."},
     )
     num_workers: int = field(
         default=1, metadata={"help": "Number of rollout worker processes"}
@@ -500,6 +489,20 @@ class TrainingArgs:
     n_gpus_per_node: int = field(
         default=8, metadata={"help": "Number of GPUs per node for this experiment."}
     )
+    nodelist: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "SLURM nodelist for manual allocation. "
+            "Format: 'slurmd-01:0,1,2,3' or 'slurmd-[01-02,03,07],COM08'."
+        },
+    )
+    exclude: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "SLURM nodelist to exclude from allocation. "
+            "Format: 'slurmd-01:0,1,2,3' or 'slurmd-[01-02,03,07],COM08'."
+        },
+    )
     seed: int = field(default=1, metadata={"help": "Random seed for reproducibility."})
     exp_ctrl: ExperimentSaveEvalControl = field(
         default_factory=ExperimentSaveEvalControl,
@@ -513,8 +516,6 @@ class TrainingArgs:
         default_factory=ClusterSpecConfig,
         metadata={"help": "Cluster specification. Mainly used by slurm."},
     )
-
-    # RL workflow configuration
     train_dataset: DatasetConfig = field(
         default_factory=DatasetConfig, metadata={"help": "Train dataset configuration"}
     )
@@ -528,3 +529,10 @@ class TrainingArgs:
     trainer: Optional[TrainerConfig] = field(
         default=None, metadata={"help": "Trainer configuration"}
     )
+    llm_service: Optional[LLMServiceConfig] = field(
+        default=None, metadata={"help": "LLM server configuration"}
+    )
+    cpu_per_inf_proc: int = 16
+    mem_per_inf_proc: int = 100000
+    cpu_per_train_proc: int = 16
+    mem_per_train_proc: int = 100000

@@ -13,7 +13,8 @@ import numpy as np
 
 from arealite.api.cli_args import RolloutControllerConfig, TrainingArgs
 from arealite.api.io_struct import Trajectory
-from arealite.api.rollout_api import RolloutWorkflow
+from arealite.api.llm_client_api import LLMClient, LLMClientFactory
+from arealite.api.rollout_api import RolloutCollector
 from arealite.system.rollout_worker import RolloutWorker
 from realhf.base import datapack, logging, network
 from realhf.system.push_pull_stream import ZMQJsonPuller, ZMQJsonPusher
@@ -26,12 +27,12 @@ class RolloutController:
         self,
         args: TrainingArgs,
         config: RolloutControllerConfig,
-        workflow: RolloutWorkflow,
+        collector: RolloutCollector,
     ):
         self.args = args
         self.config = config
         self.gconfig = config.gconfig
-        self.workflow = workflow
+        self.collector = collector
 
         # Process-based execution
         self._exiting = mp.Event()
@@ -41,6 +42,8 @@ class RolloutController:
 
         # Worker processes for asynchronous rollout
         self._worker_processes: List[mp.Process] = []
+
+        self.llm_client = LLMClientFactory(args).make_client(config.llm_client)
 
         # PushPull communication for data to workers
         self._data_pusher = None
@@ -57,7 +60,7 @@ class RolloutController:
         env_options: Optional[List[Any]] = None,
         seeds: Optional[List[int]] = None,
     ) -> List[Trajectory]:
-        """Run episodes in batch using the workflow directly (for compatibility)."""
+        """Run episodes in batch using the collector directly (for compatibility)."""
         if self.config.num_workers == 1:
             return self._generate_batch_sequential(batch_size, env_options, seeds)
 
@@ -219,8 +222,11 @@ class RolloutController:
         trajs = []
         for env_option, seed in zip(env_options, seeds):
             trajs.append(
-                self.workflow.run_episode(
-                    self.gconfig.new(n_samples=1), env_option, seed
+                self.collector.run_episode(
+                    llm_client=self.llm_client,
+                    gconfig=self.gconfig.new(n_samples=1),
+                    env_option=env_option,
+                    seed=seed,
                 )
             )
         return trajs
@@ -245,6 +251,7 @@ class RolloutController:
                 worker_id=0,
                 args=self.args,
                 config=self.config,
+                llm_client=self.llm_client,
             )
             tasks = [
                 worker._run_grouped_episode_async(None, env_option, seed)

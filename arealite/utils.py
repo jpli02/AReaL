@@ -4,9 +4,7 @@
 # Pad/unpad operations are modified from flash-attention under BSD-3 license.
 # Copyright (c) 2023, Tri Dao.
 
-import getpass
 import os
-import socket
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,7 +19,7 @@ from einops import rearrange, repeat
 from tensorboardX import SummaryWriter
 
 from arealite.api.cli_args import MicroBatchSpec, TrainingArgs
-from realhf.base import datapack
+from realhf.base import constants, datapack
 
 ############### Dict and list operations begin ###############
 
@@ -611,32 +609,10 @@ def gather_logprobs(
     return log_probs_labels
 
 
-def get_save_checkpoint_path(
-    args: TrainingArgs, epoch: int, step: int, globalstep: int
-):
-    path = os.path.join(
-        args.cluster.fileroot,
-        "checkpoints",
-        getpass.getuser(),
-        args.experiment_name,
-        args.trial_name,
-        "model",
-        f"epoch{epoch}epochstep{step}globalstep{globalstep}",
-    )
-    os.makedirs(path, exist_ok=True)
-    return path
+############### Tensor computations end ###############
 
 
-def get_log_path(args: TrainingArgs) -> str:
-    log_path = os.path.join(
-        f"{args.cluster.fileroot}",
-        "logs",
-        f"{getpass.getuser()}",
-        f"{args.experiment_name}",
-        f"{args.trial_name}",
-    )
-    os.makedirs(log_path, exist_ok=True)
-    return log_path
+############### Logging related begin ###############
 
 
 def init_stats_logging(args: TrainingArgs):
@@ -663,7 +639,7 @@ def init_stats_logging(args: TrainingArgs):
         notes=args.wandb.notes,
         tags=args.wandb.tags,
         config=args.wandb.config,
-        dir=get_log_path(args),
+        dir=constants.get_log_path(args),
         force=True,
         id=f"{args.experiment_name}_{args.trial_name}_train",
         resume="allow",
@@ -703,7 +679,90 @@ def record_timing(name, timing_stats):
     timing_stats[name] = time.perf_counter() - start_time
 
 
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("localhost", 0))
-        return s.getsockname()[1]
+############### Logging related end ###############
+
+
+############### Model load start ###############
+
+
+def get_state_dict_from_repo_id_or_path(repo_id_or_path: str) -> Dict:
+    """
+    Obtain a state dictionary from either a Hugging Face repo ID or a local path.
+
+    Args:
+        repo_id_or_path (str): Either a Hugging Face repo ID (e.g., 'username/model-name')
+                              or a local path to a directory containing model weights.
+
+    Returns:
+        Dict: The combined state dictionary from all .safetensors and .bin files.
+    """
+    from safetensors.torch import load_file as safetensors_load
+
+    state_dict = {}
+
+    # Step 1: Identify if the input is a Hugging Face repo ID or local path
+    try:
+        from huggingface_hub.utils import HFValidationError, validate_repo_id
+
+        try:
+            validate_repo_id(repo_id_or_path)
+            is_hf_repo = True
+        except HFValidationError:
+            is_hf_repo = False
+    except ImportError:
+        is_hf_repo = False
+
+    if is_hf_repo:
+        from huggingface_hub import snapshot_download
+
+        # Step 2: Download the repo if it's a Hugging Face repo ID
+        local_path = snapshot_download(
+            repo_id=repo_id_or_path,
+        )
+    else:
+        # Assume it's a local path
+        local_path = repo_id_or_path
+        if not os.path.isdir(local_path):
+            raise ValueError(
+                f"Local path {local_path} does not exist or is not a directory, "
+                f"or {local_path} is a huggingface repo id but huggingface_hub is not installed."
+            )
+
+    # Step 3: Load all .safetensors and .bin files
+    file_paths_to_load = []
+    for filename in os.listdir(local_path):
+        filepath = os.path.join(local_path, filename)
+        if filename.endswith(".safetensors") or filename.endswith(".bin"):
+            file_paths_to_load.append(filepath)
+
+    def _load(filepath: str):
+        if filepath.endswith(".safetensors"):
+            state_dict = safetensors_load(filepath)
+        elif filepath.endswith(".bin"):
+            state_dict = torch.load(filepath, map_location="cpu")
+        else:
+            raise ValueError(f"{filepath} is not a torch bin or safetensor file.")
+        return state_dict
+
+    state_dict = {}
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(
+        max_workers=min(4, max(1, os.cpu_count() // 8))
+    ) as executor:
+        future_to_checkpoint = {
+            executor.submit(_load, path): path for path in file_paths_to_load
+        }
+
+        for future in as_completed(future_to_checkpoint):
+            path = future_to_checkpoint[future]
+            try:
+                sd = future.result()
+                state_dict.update(sd)
+            except Exception as e:
+                raise RuntimeError(f"Error loading checkpoint from {path}: {e}")
+    return state_dict
+
+
+############### Model load end ###############

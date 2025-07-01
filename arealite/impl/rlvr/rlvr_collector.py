@@ -8,28 +8,30 @@ import torch
 
 from arealite.api.cli_args import (
     GenerationHyperparameters,
-    RolloutWorkflowConfig,
+    RolloutCollectorConfig,
     TrainingArgs,
 )
 from arealite.api.io_struct import LLMRequest, Trajectory, TrajStats
 from arealite.api.llm_client_api import LLMClient
-from arealite.api.rollout_api import RolloutWorkflow
+from arealite.api.rollout_api import RolloutCollector
+from realhf.base import logging
+
+logger = logging.getLogger(__file__)
 
 
-class RlvrWorkflow(RolloutWorkflow):
+class RlvrCollector(RolloutCollector):
     def __init__(
         self,
         args: TrainingArgs,
-        config: RolloutWorkflowConfig,
-        llm_client: LLMClient,
+        config: RolloutCollectorConfig,
         reward_fn: Callable,
     ):
         super().__init__(args, config, None, None)
-        self.llm_client = llm_client
         self.reward_fn = reward_fn
 
     def run_episode(
         self,
+        llm_client: LLMClient,
         gconfig: GenerationHyperparameters,
         env_option: Optional[Dict[str, Any]] = None,
         seed: Optional[int] = None,
@@ -40,7 +42,7 @@ class RlvrWorkflow(RolloutWorkflow):
         prompt_ids = env_option["input_ids"]
         query_id = env_option["query_id"]
         req = LLMRequest(input_ids=prompt_ids, gconfig=gconfig)
-        resp = self.llm_client.generate(req)
+        resp = llm_client.generate(req)
 
         reward_kwargs = env_option.copy()
         reward_kwargs.pop("query_id")
@@ -83,6 +85,7 @@ class RlvrWorkflow(RolloutWorkflow):
 
     async def arun_episode(
         self,
+        llm_client: LLMClient,
         gconfig: GenerationHyperparameters,
         env_option: Optional[Dict[str, Any]] = None,
         seed: Optional[int] = None,
@@ -95,7 +98,7 @@ class RlvrWorkflow(RolloutWorkflow):
         req = LLMRequest(input_ids=prompt_ids, gconfig=gconfig)
 
         # Use async LLM client
-        resp = await self.llm_client.agenerate(req)
+        resp = await llm_client.agenerate(req)
 
         # Run reward computation in executor to avoid blocking
         reward_kwargs = env_option.copy()
@@ -117,6 +120,10 @@ class RlvrWorkflow(RolloutWorkflow):
         prompt_mask = [1] * input_len + [0] * output_len
         logprobs = [0.0] * input_len + resp.output_logprobs
         versions = [-1] * input_len + resp.output_versions
+
+        logger.info(
+            f"Prompt: {req.text}, reward: {reward}\nCompletion: {resp.completion}"
+        )
 
         return Trajectory(
             prompt=env_option,

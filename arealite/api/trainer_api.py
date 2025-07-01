@@ -2,14 +2,16 @@
 # Licensed under the Apache License, Version 2.0
 
 import abc
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Union
 
 import torch.distributed as dist
 from datasets import Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from arealite.api.cli_args import TrainerConfig, TrainingArgs
+from realhf.base import constants
 
 if TYPE_CHECKING:
     from arealite.system.rollout_controller import RolloutController
@@ -83,6 +85,17 @@ class Trainer(abc.ABC):
     # TODO: check HF trainer signature
     def train(self, resume_from_checkpoint: Optional[Union[str, bool]] = None):
         raise NotImplementedError()
+
+    def get_save_checkpoint_path(
+        self, epoch: int, step: int, globalstep: int, name: str = "model"
+    ):
+        path = os.path.join(
+            constants.get_save_path(self.args),
+            name,
+            f"epoch{epoch}epochstep{step}globalstep{globalstep}",
+        )
+        os.makedirs(path, exist_ok=True)
+        return path
 
 
 @dataclass

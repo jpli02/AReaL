@@ -1,6 +1,7 @@
 # Copyright 2025 Ant Group Inc.
 # Licensed under the Apache License, Version 2.0
 
+import asyncio
 import functools
 import math
 import os
@@ -15,6 +16,7 @@ from torch.distributed.fsdp import StateDictType
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
+    PreTrainedModel,
     get_constant_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
@@ -22,13 +24,15 @@ from transformers import (
 from arealite.api.cli_args import EngineConfig, FSDPConfig, MicroBatchSpec, TrainingArgs
 from arealite.api.engine_api import SPMDWrapper
 from arealite.api.io_struct import FinetuneSpec
+from arealite.api.llm_client_api import LLMClient
 from arealite.utils import (
-    find_free_port,
+    get_state_dict_from_repo_id_or_path,
     recorder_list,
     split_dict_tensor_with_cu_seqlens,
     unpack_sequence,
 )
 from realhf.api.cli_args import ParallelismConfig
+from realhf.base import constants
 from realhf.base.pkg_version import is_version_greater_or_equal
 
 if is_version_greater_or_equal("torch", "2.6.0"):
@@ -124,7 +128,10 @@ def apply_fsdp2(model, fsdp_kwargs, wrap_policy):
 
 
 def fsdp2_load_full_state_dict(
-    model: torch.nn.Module, full_state: dict, device_mesh=None, cpu_offload=None
+    model: PreTrainedModel,
+    full_state: dict,
+    cpu_offload=None,
+    tie_word_embeddings=False,
 ):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
@@ -142,16 +149,22 @@ def fsdp2_load_full_state_dict(
     device = torch.cuda.current_device()
 
     # To broadcast, it needs to be instantiated in the GPU.
-    if dist.get_rank() == 0:
+    if dist.get_rank() != 0:
         model = model.to(device=device, non_blocking=True)
     else:
         model = model.to_empty(device=device)
 
     cpu_offload = cpu_offload is not None
     options = StateDictOptions(
-        full_state_dict=True, cpu_offload=cpu_offload, broadcast_from_rank0=True
+        full_state_dict=True,
+        cpu_offload=cpu_offload,
+        broadcast_from_rank0=True,
+        strict=not tie_word_embeddings,
     )
     set_model_state_dict(model, full_state, options=options)
+
+    if tie_word_embeddings:
+        model.tie_weights()
 
     # rotary_emb is not in state_dict, so we need to broadcast it manually
     for name, buf in model.named_buffers():
@@ -192,7 +205,6 @@ def get_cosine_schedule_with_warmup(
     Return:
         :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
     """
-    min_lr_ratio = 0.0 if min_lr_ratio is None else min_lr_ratio
     assert min_lr_ratio >= 0 and min_lr_ratio <= 1.0
     coef = (1 - min_lr_ratio) * 0.5
     intercept = (1 + min_lr_ratio) * 0.5
@@ -241,35 +253,23 @@ class FSDPEngine(SPMDWrapper):
 
     def init_distributed(self, config: ParallelismConfig, ft_spec: FinetuneSpec):
         """Initialize distributed communication and model."""
-        if self.args.n_gpus_per_node == 1 and self.args.n_nodes == 1:
-            if not dist.is_initialized():
-                dist.init_process_group(
-                    backend="nccl",
-                    rank=0,
-                    world_size=1,
-                    init_method=f"tcp://localhost:{find_free_port()}",
-                )
-            torch.cuda.set_device("cuda:0")
-        else:
-            if not dist.is_initialized():
-                dist.init_process_group(backend="nccl")
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
 
-            # print(f"LOCAL_RANK = {os.environ["LOCAL_RANK"]}")
-            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-            # print(f"current rank = {dist.get_rank()}, current device = {torch.cuda.current_device()}")
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-        # Load model
         dtype = torch.bfloat16 if self.engine_config.bf16 else torch.float16
-        model = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=self.engine_config.path,
-            torch_dtype=dtype,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True,
-        )
         self.model_config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path=self.engine_config.path,
             trust_remote_code=True,
         )
+        with torch.device("cuda"):
+            # initialize scratch model from config
+            model = AutoModelForCausalLM.from_config(
+                self.model_config,
+                torch_dtype=dtype,
+                attn_implementation="flash_attention_2",
+            )
 
         # Simple auto wrap policy
         # TODO: fix wrap policy
@@ -293,9 +293,7 @@ class FSDPEngine(SPMDWrapper):
         }
 
         # Wrap with FSDP2
-        full_state = model.state_dict()
         apply_fsdp2(model, fsdp_kwargs, self.fsdp_config.wrap_policy)
-        fsdp2_load_full_state_dict(model, full_state, device_mesh, self.cpu_offload)
 
         self.model = model
 
@@ -373,7 +371,6 @@ class FSDPEngine(SPMDWrapper):
         dist.all_reduce(total_loss_weight)
 
         # Process microbatches with gradient accumulation
-        # TODO: step lr scheduler if required
         for i, mb_input in enumerate(mb_inputs):
             outputs = self.model(**mb_input)
 
@@ -479,7 +476,7 @@ class FSDPEngine(SPMDWrapper):
     def save_model_to_hf(
         self,
         path: str,
-        tokenizer: transformers.PreTrainedTokenizerFast,
+        tokenizer: Optional[transformers.PreTrainedTokenizerFast] = None,
         base_model_path: Optional[str] = None,
     ):
         """Save model in HuggingFace format."""
@@ -503,32 +500,23 @@ class FSDPEngine(SPMDWrapper):
             os.makedirs(path, exist_ok=True)
             self.model.save_pretrained(path, state_dict=state_dict)
             self.model_config.save_pretrained(path)
-            tokenizer.save_pretrained(path)
+            if tokenizer is not None:
+                tokenizer.save_pretrained(path)
 
         dist.barrier()
 
     def load_model_from_hf(self, path: str):
         """Load model from HuggingFace format."""
-        # if self.model is None:
-        #     raise RuntimeError("Model not initialized")
-
-        # state_dict = torch.load(
-        #     os.path.join(path, "pytorch_model.bin"), map_location="cpu"
-        # )
-
-        # with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT):
-        #     self.model.load_state_dict(state_dictt
-        dtype = torch.bfloat16 if self.engine_config.bf16 else torch.float16
-        model = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=path,
-            torch_dtype=dtype,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=True,
-        )
-        full_state = model.state_dict()
+        if dist.get_rank() == 0:
+            full_state = get_state_dict_from_repo_id_or_path(path)
+        else:
+            full_state = {}
 
         fsdp2_load_full_state_dict(
-            self.model, full_state, self.device_mesh, self.cpu_offload
+            self.model,
+            full_state,
+            self.cpu_offload,
+            tie_word_embeddings=self.model_config.tie_word_embeddings,
         )
 
     def save_optimizer_state(self, path: str):
@@ -551,3 +539,21 @@ class FSDPEngine(SPMDWrapper):
             )
         else:
             raise RuntimeError(f"Optimizer state file not found: {optimizer_path}")
+
+    async def aupdate_weights_to(self, llm_client: LLMClient):
+        """Async method to update weights to all healthy servers."""
+        path = constants.get_param_realloc_path(self.args)
+        self.save_model_to_hf(path)
+        tasks = [
+            llm_client.aupdate_weights_from_disk(server_info=server_info, path=path)
+            for server_info in llm_client.get_healthy_servers()
+        ]
+        await asyncio.gather(*tasks)
+
+    def update_weights_to(self, llm_client: LLMClient):
+        """Update the weights to the server by sending requests to the client."""
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self.aupdate_weights_to(llm_client))
+        finally:
+            loop.close()

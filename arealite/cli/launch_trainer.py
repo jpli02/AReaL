@@ -13,7 +13,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from arealite.api.cli_args import DatasetConfig, TrainingArgs
 from arealite.api.dataset_api import DatasetFactory
-from arealite.api.rollout_api import RolloutWorkflowFactory
+from arealite.api.rollout_api import RolloutCollectorFactory
 from arealite.api.trainer_api import TrainerFactory
 from arealite.system.rollout_controller import RolloutController
 from realhf.base import constants, name_resolve, seeding
@@ -43,15 +43,15 @@ def main():
     cfg = OmegaConf.merge(default_cfg, cfg)
     cfg: TrainingArgs = OmegaConf.to_object(cfg)
 
-    seeding.set_random_seed(cfg.seed, "llm_server")
+    rank = int(os.getenv("RANK", "0"))
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+
+    seeding.set_random_seed(cfg.seed, f"trainer{rank}")
     constants.set_experiment_trial_names(cfg.experiment_name, cfg.trial_name)
     name_resolve.reconfigure(cfg.cluster.name_resolve)
 
     # Initialize the global pytorch distributed communication group.
     dist.init_process_group("nccl")
-
-    rank = int(os.getenv("RANK", "0"))
-    world_size = int(os.getenv("WORLD_SIZE", "1"))
 
     # Load and split dataset
     dataset_factory = DatasetFactory(cfg)
@@ -65,9 +65,9 @@ def main():
     # Create rollout controller for online training and evaluation.
     rollout_controller = None
     if cfg.rollout is not None:
-        rollout_factory = RolloutWorkflowFactory(cfg)
-        workflow = rollout_factory.make_workflow(cfg.rollout.workflow)
-        rollout_controller = RolloutController(cfg, cfg.rollout, workflow=workflow)
+        rollout_factory = RolloutCollectorFactory(cfg)
+        collector = rollout_factory.make_collector(cfg.rollout.collector)
+        rollout_controller = RolloutController(cfg, cfg.rollout, collector=collector)
 
     # If trainer is given, run RL or offline training.
     if cfg.trainer is not None:
