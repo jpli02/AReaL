@@ -421,7 +421,23 @@ class GRPOTrainerConfig:
             "help": "We filter out the tokens where behav_imp_weight exceeds behav_imp_weight_cap when computing the loss, must be > 1.0, use_decoupled_loss must be true"
         },
     )
-
+@dataclass
+class TreeRLTrainerConfig():
+    async_training: bool = field(
+        default=True, metadata={"help": "Enable asynchronous training mode"}
+    )
+    actor: EngineConfig = field(
+        default_factory=EngineConfig,
+        metadata={"help": "Actor model configuration"},
+    )
+    ref: Optional[EngineConfig] = field(
+        default=None, metadata={"help": "Reference model configuration"}
+    )
+    mb_spec: MicroBatchSpec = field(
+        default_factory=MicroBatchSpec,
+        metadata={"help": "Micro-batch specification"},
+    )
+    # TODO: treeRL related
 
 @dataclass
 class TrainerConfig:
@@ -434,6 +450,9 @@ class TrainerConfig:
     )
     sft: Optional[SFTTrainerConfig] = field(
         default=None, metadata={"help": "SFT trainer configuration (if using SFT)"}
+    )
+    treerl: Optional[TreeRLTrainerConfig] = field(
+        default=None, metadata={"help": "TreeRL trainer configuration (if using TreeRL)"}
     )
 
 
