@@ -147,13 +147,7 @@ def fsdp2_load_full_state_dict(
     )
 
     device = torch.cuda.current_device()
-
-    # To broadcast, it needs to be instantiated in the GPU.
-    if dist.get_rank() != 0:
-        model = model.to(device=device, non_blocking=True)
-    else:
-        model = model.to_empty(device=device)
-
+    model = model.to(device=device, non_blocking=True)
     cpu_offload = cpu_offload is not None
     options = StateDictOptions(
         full_state_dict=True,
@@ -243,7 +237,7 @@ class FSDPEngine(SPMDWrapper):
         self.device_mesh = None
         self.cpu_offload = None
 
-        self.world_size = args.n_gpus_per_node * args.n_nodes
+        self.world_size = int(os.environ["WORLD_SIZE"])
 
     def train(self, mode: bool = True):
         """Set the module in training mode."""

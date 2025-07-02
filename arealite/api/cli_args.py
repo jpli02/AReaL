@@ -1,22 +1,72 @@
 # Copyright 2025 Ant Group Inc.
 # Licensed under the Apache License, Version 2.0
-
+import argparse
+import os
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-from omegaconf import MISSING
+import uvloop
+
+uvloop.install()
+from hydra import compose as hydra_compose
+from hydra import initialize as hydra_init
+from omegaconf import MISSING, OmegaConf
 
 from realhf.api.cli_args import (
     ClusterSpecConfig,
     ExperimentSaveEvalControl,
     MicroBatchSpec,
-    ModelFamily,
     OptimizerConfig,
-    ParallelismConfig,
-    SGLangConfig,
     TensorBoardConfig,
     WandBConfig,
 )
+
+
+@dataclass(unsafe_hash=True)
+class ParallelismConfig:
+    """Configuration for 3D parallelism (tensor, pipeline, and data parallelism).
+
+    Note:
+        Sequence parallelism is only used in combination with tensor-model parallelism.
+    """
+
+    tensor_parallel_size: int = field(
+        default=1, metadata={"help": "Size of tensor-model parallelism"}
+    )
+    pipeline_parallel_size: int = field(
+        default=1, metadata={"help": "Number of pipeline parallel stages"}
+    )
+    data_parallel_size: int = field(
+        default=1, metadata={"help": "Data parallelism size for ZeRO optimization"}
+    )
+    use_sequence_parallel: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable sequence parallelism. Only used with tensor-model parallelism in Megatron",
+        },
+    )
+
+    def __str__(self):
+        """Returns compact string representation: 'Parallel(mp=X,pp=Y,dp=Z)'."""
+        return (
+            f"Parallel(mp={self.tensor_parallel_size},"
+            f"pp={self.pipeline_parallel_size},"
+            f"dp={self.data_parallel_size})"
+        )
+
+    @staticmethod
+    def parallelism_eq(this, other):
+        """Compare parallelism configurations (excluding sequence parallelism).
+
+        Note:
+            Implemented as static method to avoid OmegaConf compatibility issues.
+        """
+        return (
+            (this.tensor_parallel_size == other.tensor_parallel_size)
+            and (this.pipeline_parallel_size == other.pipeline_parallel_size)
+            and (this.data_parallel_size == other.data_parallel_size)
+        )
 
 
 @dataclass
@@ -60,19 +110,137 @@ class GenerationHyperparameters:
 
 
 ## Inference config for clients and servers. ##
+
+
+@dataclass
+class SGLangConfig:
+    """Configuration for SGLang runtime. Refer to:
+    https://github.com/sgl-project/sglang for detailed documentation.
+    """
+
+    disable_cuda_graph: bool = False
+    disable_radix_cache: bool = False
+    disable_cuda_graph_padding: bool = False
+    enable_nccl_nvls: bool = False
+    disable_outlines_disk_cache: bool = False
+    disable_custom_all_reduce: bool = False
+    disable_overlap_schedule: bool = False
+    enable_mixed_chunk: bool = False
+    enable_dp_attention: bool = False
+    enable_ep_moe: bool = False
+    enable_torch_compile: bool = False
+    torch_compile_max_bs: int = 32
+    cuda_graph_max_bs: Optional[int] = None
+    cuda_graph_bs: Optional[List[int]] = None
+    torchao_config: str = ""
+    enable_nan_detection: bool = False
+    enable_p2p_check: bool = False
+    triton_attention_reduce_in_fp32: bool = False
+    triton_attention_num_kv_splits: int = 8
+    num_continuous_decode_steps: int = 1
+    enable_memory_saver: bool = False
+    allow_auto_truncate: bool = False
+    # NOTE: to avoid the illegal memory access error
+    attention_backend: Optional[str] = "flashinfer"
+    sampling_backend: Optional[str] = None
+    context_length: Optional[int] = 32768
+    mem_fraction_static: Optional[float] = 0.9
+    max_running_requests: Optional[int] = None
+    # NOTE: chunked_prefill_size is by default 8192 on GPUs with 80GB mem in SGLang,
+    # but we disable it to avoid precision issues
+    chunked_prefill_size: Optional[int] = -1
+    max_prefill_tokens: int = 32768
+    schedule_policy: str = "lpm"
+    schedule_conservativeness: float = 1.0
+    cpu_offload_gb: int = 0
+
+    dtype: str = "float16"
+    kv_cache_dtype: str = "auto"
+
+    # logging
+    log_level: str = "warning"
+    log_level_http: Optional[str] = "warning"
+    log_requests: bool = False
+    log_requests_level: int = 0
+    show_time_cost: bool = False
+    enable_metrics: bool = True  # Exports Prometheus-like metrics
+    # The interval (in decoding iterations) to log throughput
+    # and update prometheus metrics
+    decode_log_interval: int = 1
+
+    # Use staticmethod to make OmegaConf happy.
+    @staticmethod
+    def build_cmd(
+        sglang_config: "SGLangConfig",
+        model_path,
+        tp_size,
+        base_gpu_id,
+        dist_init_addr: Optional[str] = None,
+        served_model_name: Optional[str] = None,
+        skip_tokenizer_init: bool = True,
+    ):
+        from realhf.base import network, pkg_version, seeding
+        from realhf.experiments.common.utils import asdict as conf_as_dict
+
+        args: Dict = conf_as_dict(sglang_config)
+        args["random_seed"] = seeding.get_seed()
+
+        if served_model_name is None:
+            served_model_name = model_path
+        host_ip = network.gethostip()
+        host = "localhost" if not sglang_config.enable_metrics else host_ip
+        args = dict(
+            host=host,
+            model_path=model_path,
+            # Model and tokenizer
+            tokenizer_path=model_path,
+            tokenizer_mode="auto",
+            load_format="auto",
+            trust_remote_code=True,
+            device="cuda",
+            served_model_name=served_model_name,
+            is_embedding=False,
+            skip_tokenizer_init=skip_tokenizer_init,
+            # Other runtime options
+            tp_size=tp_size,
+            # Because we have set CUDA_VISIBLE_DEVICES to a single GPU in each process
+            base_gpu_id=base_gpu_id,
+            nnodes=1,
+            node_rank=0,
+            dist_init_addr=dist_init_addr,
+            **args,
+        )
+
+        if pkg_version.is_version_less("sglang", "0.4.4"):
+            args.pop("log_requests_level")
+        if pkg_version.is_version_less("sglang", "0.4.3"):
+            args.pop("enable_nccl_nvls")
+            args.pop("triton_attention_num_kv_splits")
+            args.pop("cuda_graph_bs")
+            args.pop("enable_memory_saver")
+            args.pop("allow_auto_truncate")
+            args.pop("file_storage_path")
+
+        flags = []
+        for k, v in args.items():
+            if v is None or v is False or v == "":
+                continue
+            if v is True:
+                flags.append(f"--{k.replace('_','-')} ")
+                continue
+            if isinstance(v, list):
+                values = " ".join(map(str, v))
+                flags.append(f"--{k.replace('_','-')} {values}")
+                continue
+            flags.append(f"--{k.replace('_','-')} {v}")
+        flags = " ".join(flags)
+        return f"python3 -m sglang.launch_server {flags}"
+
+
 @dataclass
 class LLMServiceConfig:
-    server_backend: str = field(
-        default="sglang",
-        metadata={"help": "Backend for serving", "choices": ["sglang", "vllm"]},
-    )
     served_model_name: Optional[str] = field(
         default=None, metadata={"help": "Name of the served model"}
-    )
-    model_path: str = field(default="", metadata={"help": "Path to model"})
-    parallel: ParallelismConfig = field(
-        default_factory=ParallelismConfig,
-        metadata={"help": "Model parallelism configuration"},
     )
     health_check_interval: int = field(
         default=5, metadata={"help": "Health check interval in seconds"}
@@ -86,23 +254,14 @@ class LLMServiceConfig:
     graceful_shutdown_on_unhealthy: bool = field(
         default=True, metadata={"help": "Enable graceful shutdown when unhealthy"}
     )
-    sglang: Optional[SGLangConfig] = field(
-        default=None,
-        metadata={"help": "SGLang configuration (if using SGLang backend)"},
-    )
 
 
 @dataclass
 class LLMClientConfig:
-    server_backend: str = field(
-        default="sglang",
-        metadata={"help": "Backend for client", "choices": ["sglang"]},
-    )
     schedule_policy: str = field(
         default="round_robin",
         metadata={"help": "Request scheduling policy", "choices": ["round_robin"]},
     )
-    tokenizer_path: str = field(default="", metadata={"help": "Path to tokenizer"})
     request_timeout: int = field(
         default=3600, metadata={"help": "Request timeout in seconds"}
     )
@@ -125,7 +284,6 @@ class DatasetPreprocessor:
         default=None,
         metadata={
             "help": "Number of retries for each request",
-            "choices": ["gsm8k", "areal"],
         },
     )
     gsm8k: Optional[GSM8KPreprocessor] = None
@@ -267,11 +425,16 @@ class RolloutCollectorConfig:
     )
 
 
-## RolloutController configurations. ##
+## Rollout configurations. ##
 
 
 @dataclass
-class RolloutControllerConfig:
+class RolloutConfig:
+    server_backend: str = field(
+        default="sglang",
+        metadata={"help": "Backend for serving", "choices": ["sglang", "vllm"]},
+    )
+    model_path: str = field(default="", metadata={"help": "Path to the rollout model"})
     collector: RolloutCollectorConfig = field(
         default_factory=RolloutCollectorConfig,
         metadata={"help": "Rollout collector configuration."},
@@ -302,6 +465,13 @@ class RolloutControllerConfig:
     gconfig: GenerationHyperparameters = field(
         default_factory=GenerationHyperparameters,
         metadata={"help": "Generation hyperparameters for rollouts"},
+    )
+    llm_service: LLMServiceConfig = field(
+        default_factory=LLMServiceConfig, metadata={"help": "LLM server configuration"}
+    )
+    sglang: Optional[SGLangConfig] = field(
+        default_factory=SGLangConfig,
+        metadata={"help": "SGLang configuration (if using SGLang backend)"},
     )
 
 
@@ -474,7 +644,7 @@ class TrainingArgs:
         metadata={"help": "TensorBoard configuration. Only 'path' field required."},
     )
     allocation_mode: str = field(
-        default="",
+        default="sglang.d1p1t1+d1p1t1",
         metadata={
             "help": "GPU parallel strategy allocation mode. "
             "Options: manual/heuristic or pattern-based."
@@ -522,17 +692,49 @@ class TrainingArgs:
     valid_dataset: Optional[DatasetConfig] = field(
         default=None, metadata={"help": "Validation dataset configuration"}
     )
-    rollout: Optional[RolloutControllerConfig] = field(
-        default_factory=RolloutControllerConfig,
+    rollout: Optional[RolloutConfig] = field(
+        default_factory=RolloutConfig,
         metadata={"help": "Rollout controller configuration for RL training"},
     )
     trainer: Optional[TrainerConfig] = field(
         default=None, metadata={"help": "Trainer configuration"}
     )
-    llm_service: Optional[LLMServiceConfig] = field(
-        default=None, metadata={"help": "LLM server configuration"}
-    )
     cpu_per_inf_proc: int = 16
     mem_per_inf_proc: int = 100000
     cpu_per_train_proc: int = 16
     mem_per_train_proc: int = 100000
+
+
+def prepare_training_args(argv: List[str]) -> Tuple[TrainingArgs, str]:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config", help="The path of the main configuration file", required=True
+    )
+    args, overrides = parser.parse_known_args(argv)
+
+    # Initialize hydra config
+    config_file = Path(args.config).absolute()
+    assert config_file.exists()
+    # hydra only recognize relative paths
+    relpath = Path(
+        os.path.relpath(
+            str(config_file), (Path(__file__).parent.parent / "cli").absolute()
+        )
+    )
+    hydra_init(config_path=str(relpath.parent), job_name="app", version_base=None)
+    cfg = hydra_compose(
+        config_name=str(relpath.name).rstrip(".yaml"),
+        overrides=overrides,
+    )
+
+    # Merge with the default configuration
+    default_cfg = OmegaConf.structured(TrainingArgs)
+    cfg = OmegaConf.merge(default_cfg, cfg)
+    cfg: TrainingArgs = OmegaConf.to_object(cfg)
+
+    # Setup environment
+    from realhf.base import constants, name_resolve
+
+    constants.set_experiment_trial_names(cfg.experiment_name, cfg.trial_name)
+    name_resolve.reconfigure(cfg.cluster.name_resolve)
+    return cfg, str(config_file)
