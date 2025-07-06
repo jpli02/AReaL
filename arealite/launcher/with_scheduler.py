@@ -4,7 +4,7 @@
 import os
 import sys
 
-from arealite.api.cli_args import TrainingArgs, prepare_training_args
+from arealite.api.cli_args import prepare_training_args
 from arealite.api.io_struct import AllocationMode
 from arealite.api.llm_server_api import LLMServiceRegistry
 from realhf.base import constants, name_resolve, names
