@@ -77,8 +77,8 @@ rollout:
   server_backend: sglang
   model_path: /u/jli37/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-1.5B/snapshots/ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562
   gconfig:
-    n_samples: 16
-    max_new_tokens: 512
+    n_samples: 2
+    max_new_tokens: 128
     min_new_tokens: 0
     top_p: 1.0
     top_k: 1000000
@@ -105,8 +105,8 @@ rollout:
     num_continuous_decode_steps: 1
     attention_backend: "flashinfer"
     sampling_backend: null
-    context_length: 32768
-    mem_fraction_static: 0.9
+    context_length: 2048
+    mem_fraction_static: 0.8
     max_running_requests: null
     chunked_prefill_size: -1
     max_prefill_tokens: 32768
